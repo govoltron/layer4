@@ -147,7 +147,11 @@ func (s *Server) RunContext(ctx context.Context, network, addr string) error {
 		connect:    s.OnConnect,
 		disconnect: s.OnDisconnect,
 	}
-	e.pool.New = func() interface{} { return s.OnNewConnection() }
+	p := &sync.Pool{
+		New: func() interface{} { return s.OnNewConnection() },
+	}
+	e.pool.get = func() (handler ConnEventHandler) { return p.Get().(ConnEventHandler) }
+	e.pool.put = func(handler ConnEventHandler) { p.Put(handler) }
 
 	s.numConnectionsFunc = func() int { return e.engine.CountConnections() }
 	s.dupFunc = func() (int, error) { return e.engine.Dup() }
@@ -201,13 +205,16 @@ func (s *Server) Stop(ctx context.Context) (err error) {
 }
 
 type event struct {
-	ctx        context.Context
-	pool       sync.Pool
-	engine     gnet.Engine
+	ctx    context.Context
+	engine gnet.Engine
+	pool   struct {
+		get func() (handler ConnEventHandler)
+		put func(handler ConnEventHandler)
+	}
 	boot       func()
 	shutdown   func()
-	connect    func(Conn)
-	disconnect func(Conn, error)
+	connect    func(conn Conn)
+	disconnect func(conn Conn, err error)
 }
 
 func (e *event) OnBoot(engine gnet.Engine) (action gnet.Action) {
@@ -300,7 +307,7 @@ func (e *event) OnTick() (delay time.Duration, action gnet.Action) {
 }
 
 func (e *event) bindConnEventHandler(conn gnet.Conn) (handler ConnEventHandler) {
-	handler = e.pool.Get().(ConnEventHandler)
+	handler = e.pool.get()
 
 	// Bind Conn and gnet.Conn
 	conn.SetContext(handler)
@@ -321,7 +328,7 @@ func (e *event) unbindConnEventHandler(conn gnet.Conn) {
 	// Unbind
 	conn.SetContext(nil)
 
-	e.pool.Put(handler)
+	e.pool.put(handler)
 }
 
 func (e *event) handleShutdown(shutdown func()) {
