@@ -24,10 +24,9 @@ import (
 )
 
 var (
-	ErrInvalidNetwork                          = errors.New("invalid network")
-	ErrInvalidAddress                          = errors.New("invalid address")
-	ErrServerHasStopped                        = errors.New("server has stopped")
-	ErrInvalidConnectionEventHandlerCreateFunc = errors.New("invalid connection event handler creation function")
+	ErrInvalidNetwork   = errors.New("invalid network")
+	ErrInvalidAddress   = errors.New("invalid address")
+	ErrServerHasStopped = errors.New("server has stopped")
 )
 
 type Server struct {
@@ -100,9 +99,6 @@ func (s *Server) RunContext(ctx context.Context, network, addr string) error {
 	if addr == "" {
 		panic(ErrInvalidAddress)
 	}
-	if s.OnNewConnection == nil {
-		panic(ErrInvalidConnectionEventHandlerCreateFunc)
-	}
 
 	var (
 		opts       gnet.Options
@@ -147,11 +143,13 @@ func (s *Server) RunContext(ctx context.Context, network, addr string) error {
 		connect:    s.OnConnect,
 		disconnect: s.OnDisconnect,
 	}
-	p := &sync.Pool{
-		New: func() interface{} { return s.OnNewConnection() },
+	if s.OnNewConnection != nil {
+		p := &sync.Pool{
+			New: func() interface{} { return s.OnNewConnection() },
+		}
+		e.pool.get = func() (handler ConnEventHandler) { return p.Get().(ConnEventHandler) }
+		e.pool.put = func(handler ConnEventHandler) { p.Put(handler) }
 	}
-	e.pool.get = func() (handler ConnEventHandler) { return p.Get().(ConnEventHandler) }
-	e.pool.put = func(handler ConnEventHandler) { p.Put(handler) }
 
 	s.numConnectionsFunc = func() int { return e.engine.CountConnections() }
 	s.dupFunc = func() (int, error) { return e.engine.Dup() }
@@ -243,13 +241,13 @@ func (e *event) OnShutdown(eng gnet.Engine) {
 }
 
 func (e *event) OnOpen(conn gnet.Conn) (out []byte, action gnet.Action) {
-	handler := e.bindConnEventHandler(conn)
-
 	// Trigger event
 	if e.connect != nil {
 		e.connect(conn)
 	}
-	handler.OnOpen(conn)
+	if h, ok := e.bindConnEventHandler(conn); ok {
+		h.OnOpen(conn)
+	}
 
 	// If we need to shutdown the engine.
 	e.handleShutdown(func() {
@@ -260,13 +258,16 @@ func (e *event) OnOpen(conn gnet.Conn) (out []byte, action gnet.Action) {
 
 func (e *event) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	// Trigger event
-	handler, ok := e.getConnEventHandler(conn)
+	h, ok := e.getConnEventHandler(conn)
 	if !ok {
-		handler = e.bindConnEventHandler(conn)
-		defer e.unbindConnEventHandler(conn)
+		if h, ok = e.bindConnEventHandler(conn); ok {
+			defer e.unbindConnEventHandler(conn)
+		}
 	}
 
-	handler.OnTraffic(conn)
+	if ok {
+		h.OnTraffic(conn)
+	}
 
 	// If we need to shutdown the engine.
 	e.handleShutdown(func() {
@@ -276,18 +277,19 @@ func (e *event) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 }
 
 func (e *event) OnClose(conn gnet.Conn, err error) (action gnet.Action) {
-	handler, ok := e.getConnEventHandler(conn)
-	if !ok {
-		panic("unexpected event")
-	}
+	h, ok := e.getConnEventHandler(conn)
 
 	// Trigger event
-	handler.OnClose(conn, err)
+	if ok {
+		h.OnClose(conn, err)
+	}
 	if e.disconnect != nil {
 		e.disconnect(conn, err)
 	}
 
-	e.unbindConnEventHandler(conn)
+	if ok {
+		e.unbindConnEventHandler(conn)
+	}
 
 	// If we need to shutdown the engine.
 	e.handleShutdown(func() {
@@ -306,7 +308,11 @@ func (e *event) OnTick() (delay time.Duration, action gnet.Action) {
 	return
 }
 
-func (e *event) bindConnEventHandler(conn gnet.Conn) (handler ConnEventHandler) {
+func (e *event) bindConnEventHandler(conn gnet.Conn) (handler ConnEventHandler, ok bool) {
+	if ok = (e.pool.get != nil); !ok {
+		return
+	}
+
 	handler = e.pool.get()
 
 	// Bind Conn and gnet.Conn
